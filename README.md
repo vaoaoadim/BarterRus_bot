@@ -1,1 +1,0 @@
-# BarterRus_bot
