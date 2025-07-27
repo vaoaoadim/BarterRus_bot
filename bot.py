@@ -1,212 +1,105 @@
-
 import asyncio
-import time
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart
-from aiogram.client.default import DefaultBotProperties
+from aiogram.types import Message, CallbackQuery, InputMediaPhoto
+from config import BOT_TOKEN, GROUP_CHAT_ID
+from keyboards import main_kb, direction_kb, category_kb
+from database import add_ad
+from barter_logic import search_ads, format_ad
 
-from config import BOT_TOKEN, CHANNEL_ID
-from keyboards import main_kb, direction_kb, category_kb, back_button
-from database import add_ad, get_last_ad_time
-from barter_logic import format_ad
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-dp = Dispatcher()
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+dp = Dispatcher(storage=MemoryStorage())
 
-user_state = {}
+class AdState(StatesGroup):
+    choosing_direction = State()
+    choosing_category = State()
+    entering_title = State()
+    entering_description = State()
+
+user_data = {}
 
 @dp.message(CommandStart())
-async def start(msg: Message):
-    await msg.answer(
-        "Привет! Это бот для рекламы по бартеру.\n"
-        "Здесь ты можешь оставить свою заявку на обмен рекламой на товар/услугу или наоборот.",
-        reply_markup=main_kb
+async def cmd_start(message: Message, state: FSMContext):
+    await message.answer("Привет! Что вы хотите сделать?", reply_markup=main_kb)
+
+@dp.message(F.text == "➕ Разместить заявку")
+async def create_ad_start(message: Message, state: FSMContext):
+    await state.set_state(AdState.choosing_direction)
+    await message.answer("Выберите направление обмена:", reply_markup=direction_kb)
+
+@dp.callback_query(AdState.choosing_direction)
+async def choose_direction(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(direction=callback.data)
+    await state.set_state(AdState.choosing_category)
+    await callback.message.edit_text("Выберите категорию:", reply_markup=category_kb)
+
+@dp.callback_query(AdState.choosing_category)
+async def choose_category(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(category=callback.data)
+    await state.set_state(AdState.entering_title)
+    await callback.message.edit_text("Введите заголовок вашей заявки:")
+
+@dp.message(AdState.entering_title)
+async def enter_title(message: Message, state: FSMContext):
+    await state.update_data(title=message.text)
+    await state.set_state(AdState.entering_description)
+    await message.answer("Введите описание заявки. Вы также можете прикрепить одно изображение к этому сообщению (не обязательно):")
+
+@dp.message(AdState.entering_description, F.photo)
+async def enter_description_with_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    await state.clear()
+
+    description = message.caption or "(без описания)"
+    photo_id = message.photo[-1].file_id
+    contact = f"@{message.from_user.username}" if message.from_user.username else f"tg://user?id={message.from_user.id}"
+
+    add_ad(
+        data["direction"],
+        data["category"],
+        data["title"],
+        description,
+        contact
     )
 
-@dp.message()
-async def handle_text(msg: Message):
-    user_id = msg.from_user.id
-    text = msg.text.strip()
+    text = format_ad((None, data["direction"], data["category"], data["title"], description, contact))
 
-    if text == "➕ Добавить заявку":
-        last_time = get_last_ad_time(user_id)
-        now = int(time.time())
+    await message.answer("Ваша заявка опубликована!")
+    await bot.send_photo(chat_id=GROUP_CHAT_ID, photo=photo_id, caption=text)
 
-        if last_time and now - last_time < 43200:
-            remaining = int((43200 - (now - last_time)) / 60)
-            await msg.answer(f"⏳ Ты уже оставлял заявку. Попробуй снова через {remaining} минут.")
-            return
+@dp.message(AdState.entering_description)
+async def enter_description(message: Message, state: FSMContext):
+    data = await state.get_data()
+    await state.clear()
 
-        user_state[user_id] = {}
-        await msg.answer("Выбери направление обмена:", reply_markup=direction_kb)
+    description = message.text
+    contact = f"@{message.from_user.username}" if message.from_user.username else f"tg://user?id={message.from_user.id}"
 
-    elif text == "🔙 Назад":
-        state = user_state.get(user_id, {})
-        if "contact" in state:
-            del state["contact"]
-            await msg.answer("Укажи свой контакт (ник, телеграм или ссылка):", reply_markup=back_button)
-        elif "description" in state:
-            del state["description"]
-            await msg.answer("Теперь опиши подробнее, что ты предлагаешь или ищешь:", reply_markup=back_button)
-        elif "title" in state:
-            del state["title"]
-            await msg.answer("Введи краткий заголовок своей заявки:", reply_markup=back_button)
-        elif "category" in state:
-            del state["category"]
-            await msg.answer("Выбери категорию:", reply_markup=category_kb)
-        elif "direction" in state:
-            del state["direction"]
-            await msg.answer("Выбери направление обмена:", reply_markup=direction_kb)
-        else:
-            user_state.pop(user_id, None)
-            await msg.answer("Вы вернулись в главное меню.", reply_markup=main_kb)
+    add_ad(
+        data["direction"],
+        data["category"],
+        data["title"],
+        description,
+        contact
+    )
 
-    elif user_id in user_state:
-        state = user_state[user_id]
-        if "title" not in state:
-            state["title"] = text
-            await msg.answer("Теперь опиши подробнее, что ты предлагаешь или ищешь:", reply_markup=back_button)
-        elif "description" not in state:
-            state["description"] = text
-            await msg.answer("Укажи свой контакт (ник, телеграм или ссылка):", reply_markup=back_button)
-        elif "contact" not in state:
-            state["contact"] = text
-            add_ad(
-                user_id=user_id,
-                direction=state["direction"],
-                category=state["category"],
-                title=state["title"],
-                description=state["description"],
-                contact=state["contact"]
-            )
-            # Отправка в канал
-            await bot.send_message(CHANNEL_ID, format_ad((
-                None, state["direction"], state["category"],
-                state["title"], state["description"], state["contact"]
-            )))
-            await msg.answer("✅ Твоя заявка сохранена и отправлена в каталог!\nВозвращайся через 12 часов, чтобы создать новую.", reply_markup=main_kb)
-            del user_state[user_id]
+    text = format_ad((None, data["direction"], data["category"], data["title"], description, contact))
 
-@dp.callback_query(F.data.startswith("dir:"))
-async def choose_category(callback: CallbackQuery):
-    direction = callback.data.split(":")[1]
-    user_state[callback.from_user.id] = {"direction": direction}
-    await callback.message.answer("Выбери категорию:", reply_markup=category_kb)
+    await message.answer("Ваша заявка опубликована!")
+    await bot.send_message(chat_id=GROUP_CHAT_ID, text=text)
 
-@dp.callback_query(F.data.startswith("cat:"))
-async def ask_title(callback: CallbackQuery):
-    category = callback.data.split(":")[1]
-    user_state[callback.from_user.id]["category"] = category
-    await callback.message.answer("Введи краткий заголовок своей заявки:", reply_markup=back_button)
+@dp.message(F.text == "🔍 Смотреть заявки")
+async def view_ads(message: Message):
+    await message.answer("Открыть каталог заявок:", reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="📂 Перейти в канал", url=f"https://t.me/c/{str(GROUP_CHAT_ID).lstrip('-100')}")]
+    ]))
 
 async def main():
-    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-from config import BOT_TOKEN, CHANNEL_ID
-from keyboards import main_kb, direction_kb, category_kb, back_button
-from database import add_ad, get_last_ad_time
-from barter_logic import format_ad
-
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-dp = Dispatcher()
-
-user_state = {}
-
-@dp.message(CommandStart())
-async def start(msg: Message):
-    await msg.answer(
-        "Привет! Это бот для рекламы по бартеру.\n"
-        "Здесь ты можешь оставить свою заявку на обмен рекламой на товар/услугу или наоборот.",
-        reply_markup=main_kb
-    )
-
-@dp.message()
-async def handle_text(msg: Message):
-    user_id = msg.from_user.id
-    text = msg.text.strip()
-
-    if text == "➕ Добавить заявку":
-        last_time = get_last_ad_time(user_id)
-        now = int(time.time())
-
-        if last_time and now - last_time < 43200:
-            remaining = int((43200 - (now - last_time)) / 60)
-            await msg.answer(f"⏳ Ты уже оставлял заявку. Попробуй снова через {remaining} минут.")
-            return
-
-        user_state[user_id] = {}
-        await msg.answer("Выбери направление обмена:", reply_markup=direction_kb)
-
-    elif text == "🔙 Назад":
-        state = user_state.get(user_id, {})
-        if "contact" in state:
-            del state["contact"]
-            await msg.answer("Укажи свой контакт (ник, телеграм или ссылка):", reply_markup=back_button)
-        elif "description" in state:
-            del state["description"]
-            await msg.answer("Теперь опиши подробнее, что ты предлагаешь или ищешь:", reply_markup=back_button)
-        elif "title" in state:
-            del state["title"]
-            await msg.answer("Введи краткий заголовок своей заявки:", reply_markup=back_button)
-        elif "category" in state:
-            del state["category"]
-            await msg.answer("Выбери категорию:", reply_markup=category_kb)
-        elif "direction" in state:
-            del state["direction"]
-            await msg.answer("Выбери направление обмена:", reply_markup=direction_kb)
-        else:
-            user_state.pop(user_id, None)
-            await msg.answer("Вы вернулись в главное меню.", reply_markup=main_kb)
-
-    elif user_id in user_state:
-        state = user_state[user_id]
-        if "title" not in state:
-            state["title"] = text
-            await msg.answer("Теперь опиши подробнее, что ты предлагаешь или ищешь:", reply_markup=back_button)
-        elif "description" not in state:
-            state["description"] = text
-            await msg.answer("Укажи свой контакт (ник, телеграм или ссылка):", reply_markup=back_button)
-        elif "contact" not in state:
-            state["contact"] = text
-            add_ad(
-                user_id=user_id,
-                direction=state["direction"],
-                category=state["category"],
-                title=state["title"],
-                description=state["description"],
-                contact=state["contact"]
-            )
-            # Отправка в канал
-            await bot.send_message(CHANNEL_ID, format_ad((
-                None, state["direction"], state["category"],
-                state["title"], state["description"], state["contact"]
-            )))
-            await msg.answer("✅ Твоя заявка сохранена и отправлена в каталог!\nВозвращайся через 12 часов, чтобы создать новую.", reply_markup=main_kb)
-            del user_state[user_id]
-
-@dp.callback_query(F.data.startswith("dir:"))
-async def choose_category(callback: CallbackQuery):
-    direction = callback.data.split(":")[1]
-    user_state[callback.from_user.id] = {"direction": direction}
-    await callback.message.answer("Выбери категорию:", reply_markup=category_kb)
-
-@dp.callback_query(F.data.startswith("cat:"))
-async def ask_title(callback: CallbackQuery):
-    category = callback.data.split(":")[1]
-    user_state[callback.from_user.id]["category"] = category
-    await callback.message.answer("Введи краткий заголовок своей заявки:", reply_markup=back_button)
-
-async def main():
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
